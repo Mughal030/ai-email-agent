@@ -1,0 +1,419 @@
+// =========================================================================
+// AI Email Agent — Prisma Schema (v2: multi-model + reasoning traces)
+// =========================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================================================
+// 1. USERS — now with password + role for NextAuth
+// =========================================================================
+model User {
+  id            String         @id @default(cuid())
+  email         String         @unique
+  name          String?
+  passwordHash  String?        // null for sandbox demo-user; set for real accounts
+  role          String         @default("user")  // "admin" | "user"
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  gmailAccounts  GmailAccount[]
+  systemPrompts  SystemPrompt[]
+  leads          Lead[]
+  emailLogs      EmailLog[]
+  aiModelCalls   AiModelCall[]
+  leadResearch   LeadResearch[]
+}
+
+// =========================================================================
+// 2. SENDER ACCOUNTS — now stores SMTP/IMAP creds (not OAuth)
+// =========================================================================
+model GmailAccount {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  email             String   @unique           // sender email (ghab79646@gmail.com)
+  displayName       String?                    // "AI Sales Agent"
+
+  // SMTP credentials — encrypted with AES-256-GCM
+  encryptedSmtpPass String?
+  smtpHost          String?  @default("smtp.gmail.com")
+  smtpPort          Int      @default(465)
+
+  // IMAP credentials (for inbox polling)
+  imapHost          String?  @default("imap.gmail.com")
+  imapPort          Int      @default(993)
+
+  // Rate-limit guard
+  sentToday         Int      @default(0)
+  sentDate          DateTime?
+
+  // Inbox monitoring cursor
+  lastPollAt        DateTime?
+  lastSeenUid       Int      @default(0)
+
+  isActive          Boolean  @default(true)
+
+  // ---- Smart send scheduler settings ----
+  // Master on/off for autonomous sending (separate from isActive which
+  // controls both sending AND inbox polling)
+  // DEFAULT: true (paused) — user must manually click "Resume Sending"
+  // to start automated email sending. This prevents accidental sends.
+  sendingPaused    Boolean  @default(true)
+  // Max emails to send per day (Gmail cap is ~500; we default 50 to be safe)
+  dailySendLimit   Int      @default(50)
+  // Send window in the sender's timezone (24h format)
+  sendWindowStartHour Int   @default(9)   // 9 AM
+  sendWindowEndHour   Int   @default(17)  // 5 PM
+  senderTimezone  String   @default("America/New_York")
+  // Minimum minutes between consecutive sends (anti-spam)
+  minMinutesBetweenSends Int @default(3)
+  bookingUrl     String?
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  emailLogs         EmailLog[]
+  leads             Lead[]
+
+  @@index([userId])
+}
+
+// =========================================================================
+// 3. SYSTEM PROMPTS
+// =========================================================================
+model SystemPrompt {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name        String
+  content     String
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  emailLogs   EmailLog[]
+  leads       Lead[]
+}
+
+// =========================================================================
+// 4. LEADS
+// =========================================================================
+model Lead {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  gmailAccountId String?
+  gmailAccount  GmailAccount? @relation(fields: [gmailAccountId], references: [id], onDelete: SetNull)
+
+  systemPromptId String?
+  systemPrompt   SystemPrompt? @relation(fields: [systemPromptId], references: [id], onDelete: SetNull)
+
+  name          String
+  email         String
+  company       String?
+  role          String?
+  industry      String?
+  companySize   String?
+  notes         String?
+  linkedinUrl   String?
+
+  status        LeadStatus @default(PENDING)
+  queuedAt      DateTime?
+  sentAt        DateTime?
+  repliedAt     DateTime?
+  lastAutoReplyAt DateTime?
+  // Smart scheduler: when the AI plans to send this lead's outreach
+  scheduledFor  DateTime?
+  leadScore     Int      @default(0)
+  followupStage  Int      @default(0)
+  followupSentAt DateTime?
+
+  psychProfile  LeadPsychProfile?
+  emailLogs     EmailLog[]
+
+  isArchived    Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([industry])
+  @@index([gmailAccountId])
+}
+
+// =========================================================================
+// 5. LEAD PSYCHOLOGICAL PROFILES — now stores which AI model built it
+// =========================================================================
+model LeadPsychProfile {
+  id              String   @id @default(cuid())
+  leadId          String   @unique
+  lead            Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  personalityArchetype String?
+  dominantMotivator    String?
+  communicationStyle   String?
+  painPoints          String?   // JSON array
+  angleRecommended    String?
+  reasoningTrace      String?
+
+  // Which AI model produced this analysis?
+  aiModel         String?   // "deepseek-v4-flash" | "gemma-4-31b" | "minimax-m3"
+  aiReasoning     String?   // The model's chain-of-thought (from Deepseek "reasoning" field)
+  aiLatencyMs     Int?      // How long the AI call took
+
+  confidence      Float    @default(0.5)
+  version         Int      @default(1)
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// =========================================================================
+// 6. EMAIL LOGS — now tracks which AI model wrote each AI-generated email
+// =========================================================================
+model EmailLog {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  gmailAccountId String
+  gmailAccount  GmailAccount @relation(fields: [gmailAccountId], references: [id], onDelete: Cascade)
+
+  leadId        String
+  lead          Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  systemPromptId String?
+  systemPrompt   SystemPrompt? @relation(fields: [systemPromptId], references: [id], onDelete: SetNull)
+
+  direction     EmailDirection
+  status        EmailStatus
+
+  subject       String?
+  bodyText      String
+  bodyHtml      String?
+
+  // Message tracking (now from SMTP Message-ID header + IMAP UID)
+  smtpMessageId String?  @unique  // RFC822 Message-ID we generated
+  imapUid       Int?              // IMAP UID for inbound replies
+  inReplyTo     String?
+  threadKey     String?  // we maintain our own thread key (leadId-based)
+
+  // AI artifacts
+  strategyUsed      String?
+  psychAnalysis     String?
+  sentimentOfReply  String?
+  replyIntent       String?
+
+  // Multi-model tracking
+  aiModel         String?   // which model wrote this
+  aiReasoning     String?   // chain-of-thought from the model
+  aiLatencyMs     Int?
+
+  queuedAt      DateTime?
+  sentAt        DateTime?
+  receivedAt    DateTime?
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([leadId])
+  @@index([gmailAccountId])
+  @@index([status])
+  @@index([direction])
+  @@index([threadKey])
+}
+
+// =========================================================================
+// 7. AGENT MEMORY
+// =========================================================================
+model AgentMemory {
+  id            String   @id @default(cuid())
+  userId        String
+
+  scope         MemoryScope @default(GLOBAL)
+  scopeKey      String?
+
+  lesson        String
+  evidence      String?
+  category      String
+  impactScore   Float    @default(0.5)
+  sampleSize    Int      @default(0)
+  positiveRate  Float    @default(0)
+
+  isActive      Boolean  @default(true)
+  supersededById String?
+
+  // Which AI model produced this lesson
+  aiModel       String?
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([userId])
+  @@index([scope, scopeKey])
+  @@index([isActive])
+}
+
+// =========================================================================
+// 8. SELF IMPROVEMENT LOGS
+// =========================================================================
+model SelfImprovementLog {
+  id            String   @id @default(cuid())
+  userId        String
+
+  windowStart   DateTime
+  windowEnd     DateTime
+
+  emailsAnalyzed Int     @default(0)
+  leadsAnalyzed  Int     @default(0)
+
+  summary       String
+  newLessons    String?
+  retiredLessonIds String?
+  newMemoryIds  String?
+  metricsJson   String?
+
+  // Which model ran the analysis
+  aiModel       String?
+  aiReasoning   String?
+
+  createdAt     DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+// =========================================================================
+// 9. LEAD RESEARCH — AI-researched prospect companies with outreach
+// =========================================================================
+model LeadResearch {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Search criteria that produced this lead
+  searchQuery     String
+  industry        String?
+  location        String?
+
+  // Company info (from web search + AI analysis)
+  companyName     String
+  website         String
+  industryInferred String?
+  locationInferred String?
+  estimatedSize   String?
+  description     String?
+
+  // AI analysis
+  whyGoodProspect String   // why they're a good AI prospect
+  aiSolutionRec   String   // what AI solution could help
+  painPoint       String   // specific pain point to highlight
+  opportunityScore Int     @default(50)  // 0-100, higher = better
+  reasoningTrace  String?
+
+  // Generated outreach (Mistral)
+  coldEmail       String?
+  linkedinMessage String?
+  followupDay2    String?
+  followupDay5    String?
+  followupDay10   String?
+
+  // AI model tracking
+  analysisModel   String?
+  outreachModel   String?
+  aiLatencyMs     Int?
+
+  // Status
+  isImportedToPipeline Boolean @default(false)
+  importedLeadId  String?
+
+  createdAt       DateTime @default(now())
+
+  @@index([userId])
+  @@index([opportunityScore])
+  @@index([isImportedToPipeline])
+}
+
+// =========================================================================
+// 10. AI MODEL CALLS — analytics table for per-model performance tracking
+// =========================================================================
+model AiModelCall {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  model         String   // "deepseek-v4-flash", "gemma-4-31b", "minimax-m3"
+  taskType      String   // "analyze_psychology" | "draft_outreach" | "analyze_reply" | "draft_auto_reply" | "self_improve"
+  leadId        String?
+  emailLogId    String?
+
+  // Input/output stats
+  promptTokens  Int?
+  outputTokens  Int?
+  latencyMs     Int?
+  success       Boolean  @default(true)
+  errorMessage  String?
+
+  // Truncated preview of the output (for the analytics dashboard)
+  outputPreview String?
+
+  createdAt     DateTime @default(now())
+
+  @@index([userId])
+  @@index([model])
+  @@index([taskType])
+  @@index([createdAt])
+}
+
+// =========================================================================
+// ENUMS
+// =========================================================================
+enum LeadStatus {
+  PENDING
+  QUEUED
+  ANALYZING
+  DRAFTING
+  SENT
+  OPENED
+  REPLIED
+  AUTO_REPLIED
+  IGNORED
+  BOUNCED
+  FAILED
+  OPT_OUT
+  CONVERTED
+}
+
+enum EmailDirection {
+  OUTREACH
+  FOLLOWUP
+  REPLY
+  AUTO_REPLY
+  INBOUND_REPLY
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  DELIVERED
+  OPENED
+  FAILED
+  DRAFT
+}
+
+enum MemoryScope {
+  GLOBAL
+  INDUSTRY
+  ROLE
+  COMPANY_SIZE
+}
