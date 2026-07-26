@@ -6,13 +6,14 @@ RUN npm install --legacy-peer-deps
 COPY . .
 RUN npx prisma generate
 RUN npx next build
-EXPOSE 7860
-ENV PORT=7860
+RUN cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/
+EXPOSE 3000
+ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
 ENV HF_PRODUCTION_MODE=true
 ENV ADMIN_USERNAME=adminmughal03
 ENV ADMIN_PASSWORD=adminumair0302
-ENV INTERNAL_APP_URL=http://localhost:7860
+ENV INTERNAL_APP_URL=http://localhost:3000
 ENV NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 ENV NVIDIA_MODEL_DEEPSEEK=deepseek-ai/deepseek-v4-flash
 ENV NVIDIA_MODEL_GEMMA=google/gemma-4-31b-it
